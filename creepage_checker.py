@@ -7,7 +7,7 @@ import wx
 
 class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "Creepage Checker"
+        self.name = "KiCad 10 True Surface Creepage Solver"
         self.category = "Verification"
         self.description = "Calculates true 3D surface creepage (Zone Extractor & MicroVias)."
         self.show_toolbar_button = True
@@ -22,7 +22,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
     def Run(self):
         t0 = time.time()
         board = pcbnew.GetBoard()
-        BUILD_VERSION = "v187.4"
+        BUILD_VERSION = "v188.1"
 
         # =====================================================================
         # NET SELECTION + IEC 60664-1 PARAMETER DIALOG
@@ -121,6 +121,40 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                                f"(entered directly, no IEC table lookup performed)")
 
         # =====================================================================
+        # TARGETED ZONE REFILL (opt-in) — GetFilledPolysList() returns whatever
+        # was last computed by KiCad, not a live recompute. If a zone on net A
+        # or net B was edited (e.g. a trace moved) since its last fill, the
+        # geometry this tool measures against would be stale. Refilling fixes
+        # that, but forcibly filling zones is a real edit to the board with
+        # its own side effects — on some HV designs a zone may be left
+        # deliberately unfilled specifically to avoid triggering fill-time
+        # conflicts unrelated to the clearance question being checked here.
+        # So this only runs if explicitly requested in the dialog, and even
+        # then touches ONLY zones on net A or net B, never any other net.
+        # =====================================================================
+        refill_ab_zones = dlg_result["refill_ab_zones"]
+        _zones_on_ab = [z for z in board.Zones() if z.GetNetname() in (NET_A_NAME, NET_B_NAME)]
+        if refill_ab_zones:
+            try:
+                if _zones_on_ab and hasattr(pcbnew, "ZONE_FILLER"):
+                    _filler = pcbnew.ZONE_FILLER(board)
+                    _filler.Fill(_zones_on_ab)
+                    diag_lines.append(f"Refilled {len(_zones_on_ab)} zone(s) on net A/B before analysis "
+                                       f"(requested in dialog). No other net's zones were touched.")
+                elif _zones_on_ab:
+                    diag_lines.append(f"WARNING: refill was requested, but pcbnew.ZONE_FILLER is unavailable "
+                                       f"in this KiCad build — could not force a refill. Refill manually "
+                                       f"(Edit > Fill All Zones) before running if unsure.")
+            except Exception as _refill_e:
+                diag_lines.append(f"WARNING: zone refill for net A/B failed ({type(_refill_e).__name__}: {_refill_e}) "
+                                   f"— proceeding with whatever fill data is currently available, which may be stale.")
+        elif _zones_on_ab:
+            diag_lines.append(f"NOTE: {len(_zones_on_ab)} zone(s) on net A/B were NOT refilled (not requested). "
+                               f"If either net's zone geometry was edited since its last manual fill in KiCad, "
+                               f"this analysis is working from that stale fill data, not current geometry. "
+                               f"Refill manually first, or re-run with the refill option checked, if unsure.")
+
+        # =====================================================================
         # BOARD INVENTORY DUMP — logs every Edge.Cuts shape, NPTH pad, and any
         # pad/via/zone on a third net (neither net A nor net B). Useful for
         # troubleshooting when an obstacle isn't being routed around as
@@ -217,7 +251,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         for d in list(board.GetDrawings()):
             _d_width = d.GetWidth() if hasattr(d, 'GetWidth') else None
             _d_text = d.GetText() if hasattr(d, 'GetText') else ""
-            if d.GetLayer() in [comment_layer, pcbnew.F_SilkS, pcbnew.B_SilkS, pcbnew.Dwgs_User, pcbnew.F_Adhes, pcbnew.B_Adhes] and (_d_width == magic_width or _d_width == magic_marker_width or ("CREEPAGE" in _d_text.upper()) or ("IEC REQUIRED" in _d_text.upper()) or ("NO PATH FOUND" in _d_text.upper()) or ("NO COPPER NODES" in _d_text.upper())):
+            if d.GetLayer() in [comment_layer, pcbnew.F_SilkS, pcbnew.B_SilkS, pcbnew.Dwgs_User, pcbnew.F_Adhes, pcbnew.B_Adhes] and (_d_width == magic_width or _d_width == magic_marker_width or ("CREEPAGE" in _d_text.upper()) or ("REQUIRED" in _d_text.upper()) or ("NO PATH FOUND" in _d_text.upper()) or ("NO COPPER NODES" in _d_text.upper())):
                 board.Remove(d)
         for t in list(board.GetTracks()):
             if isinstance(t, pcbnew.PCB_VIA) and t.GetWidth() == magic_via_width:
@@ -231,7 +265,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         # instead comes from lazy/memoized evaluation below (only compute what the
         # search actually visits) rather than from reducing resolution.
         res_iu = pcbnew.FromMM(0.025)
-        poly_error_iu = int(pcbnew.FromMM(0.01))
+        poly_error_iu = int(pcbnew.FromMM(0.001))
 
         enabled_copper_layers = []
         for i in range(128):
@@ -454,17 +488,32 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
         for track in board.GetTracks():
             if isinstance(track, pcbnew.PCB_TRACK) and track.GetNetname():
-                p1, p2, w = track.GetStart(), track.GetEnd(), track.GetWidth()
-                r = w // 2
-                dx, dy = p2.x - p1.x, p2.y - p1.y
-                dist = math.hypot(dx, dy)
-                if dist > 0:
-                    nx, ny = int(-(dy/dist)*r), int((dx/dist)*r)
-                    chain = pcbnew.SHAPE_LINE_CHAIN()
-                    chain.Append(p1.x+nx, p1.y+ny); chain.Append(p2.x+nx, p2.y+ny)
-                    chain.Append(p2.x-nx, p2.y-ny); chain.Append(p1.x-nx, p1.y-ny)
-                    chain.SetClosed(True)
-                    sample_chain(chain, track.GetNetname(), list(track.GetLayerSet().CuStack()))
+                # Use KiCad's own effective shape rather than hand-building a flat
+                # rectangle from the segment's start/end ± half-width: a real track
+                # segment's copper has ROUNDED end caps (radius = width/2), the same
+                # capsule/stadium shape KiCad itself uses for DRC and collision. A
+                # flat-rectangle approximation is missing that cap's bulge, which
+                # matters most exactly at a bend — the outer/convex side of a joint
+                # between two angled segments is where the true copper extends
+                # furthest toward nearby copper, via the cap, not the flat edge.
+                if hasattr(track, "GetEffectiveShape"):
+                    poly = pcbnew.SHAPE_POLY_SET()
+                    track.GetEffectiveShape().TransformToPolygon(poly, poly_error_iu, 0)
+                    sample_poly_set_fully(poly, track.GetNetname(), list(track.GetLayerSet().CuStack()))
+                else:
+                    # Fallback for older API without GetEffectiveShape(): flat
+                    # rectangle only, no end caps — less accurate at bends/ends.
+                    p1, p2, w = track.GetStart(), track.GetEnd(), track.GetWidth()
+                    r = w // 2
+                    dx, dy = p2.x - p1.x, p2.y - p1.y
+                    dist = math.hypot(dx, dy)
+                    if dist > 0:
+                        nx, ny = int(-(dy/dist)*r), int((dx/dist)*r)
+                        chain = pcbnew.SHAPE_LINE_CHAIN()
+                        chain.Append(p1.x+nx, p1.y+ny); chain.Append(p2.x+nx, p2.y+ny)
+                        chain.Append(p2.x-nx, p2.y-ny); chain.Append(p1.x-nx, p1.y-ny)
+                        chain.SetClosed(True)
+                        sample_chain(chain, track.GetNetname(), list(track.GetLayerSet().CuStack()))
 
         all_rows, all_cols = [], []
         for l_dict in [hvp_nodes, hvm_nodes]:
@@ -611,11 +660,16 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             if not hasattr(zone, "GetFilledPolysList"):
                 continue
             zone_layers = list(zone.GetLayerSet().CuStack()) if hasattr(zone, "GetLayerSet") else [zone.GetLayer()]
+            _zone_added = False
+            _zone_errs = []
+            _zone_outline_counts = []
             for layer in zone_layers:
                 try:
                     poly_set = zone.GetFilledPolysList(layer)
-                except Exception:
+                except Exception as e:
+                    _zone_errs.append(f"{board.GetLayerName(layer)}: {type(e).__name__}: {e}")
                     continue
+                _zone_outline_counts.append(f"{board.GetLayerName(layer)}={poly_set.OutlineCount()}")
                 for p_idx in range(poly_set.OutlineCount()):
                     outline = poly_set.Outline(p_idx)
                     n_pts = outline.PointCount()
@@ -629,6 +683,19 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         obstacle_kind.append('third_net')
                         conductor_polys_by_layer.setdefault(layer, []).append(ring)
                         _other_zone_count += 1
+                        _zone_added = True
+            if not _zone_added:
+                _zbb = zone.GetBoundingBox()
+                diag_lines.append(f"NOTE: obstacle zone net='{net_name}' bbox=({pcbnew.ToMM(_zbb.GetX()):.3f},{pcbnew.ToMM(_zbb.GetY()):.3f}) to "
+                                   f"({pcbnew.ToMM(_zbb.GetRight()):.3f},{pcbnew.ToMM(_zbb.GetBottom()):.3f}) "
+                                   f"produced NO obstacle geometry on any of {len(zone_layers)} layer(s) tried "
+                                   f"— outline counts: {_zone_outline_counts if _zone_outline_counts else '(none read)'}"
+                                   f"{'; errors: ' + '; '.join(_zone_errs) if _zone_errs else ''}. "
+                                   f"If this is unexpected, GetFilledPolysList() reflects the LAST fill computed "
+                                   f"in KiCad, not a live recompute — an unfilled or stale-filled zone has no "
+                                   f"realized copper and is correctly excluded here. If the zone is intentionally "
+                                   f"left unfilled (e.g. reserved/placeholder copper not yet poured), this is "
+                                   f"expected and requires no action.")
         if _other_zone_count:
             diag_lines.append(f"Added {_other_zone_count} third-net zone outline(s) as obstacles (net != A/B)")
 
@@ -1582,6 +1649,92 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             t5 = time.time()
             diag_lines.append(f"Timing - Smoothing + tangent correction + global opt: {t5-t4:.2f}s")
 
+            def _seg_seg_closest(p1, p2, p3, p4):
+                # Exact closest points between two finite line segments (p1-p2)
+                # and (p3-p4) — the true analytic minimum anywhere along both
+                # edges, not just at their tessellated vertices. Shared by the
+                # via-conductor search and the global direct minimum search.
+                d1x, d1y = p2[0]-p1[0], p2[1]-p1[1]
+                d2x, d2y = p4[0]-p3[0], p4[1]-p3[1]
+                rx, ry = p1[0]-p3[0], p1[1]-p3[1]
+                a = d1x*d1x + d1y*d1y
+                e = d2x*d2x + d2y*d2y
+                f = d2x*rx + d2y*ry
+                if a <= 1e-9 and e <= 1e-9:
+                    s = t = 0.0
+                elif a <= 1e-9:
+                    s = 0.0
+                    t = max(0.0, min(1.0, f/e))
+                else:
+                    c = d1x*rx + d1y*ry
+                    if e <= 1e-9:
+                        t = 0.0
+                        s = max(0.0, min(1.0, -c/a))
+                    else:
+                        b = d1x*d2x + d1y*d2y
+                        denom = a*e - b*b
+                        s = max(0.0, min(1.0, (b*f - c*e)/denom)) if denom != 0 else 0.0
+                        t = (b*s + f) / e
+                        if t < 0.0:
+                            t = 0.0; s = max(0.0, min(1.0, -c/a))
+                        elif t > 1.0:
+                            t = 1.0; s = max(0.0, min(1.0, (b - c)/a))
+                pt1 = (p1[0] + d1x*s, p1[1] + d1y*s)
+                pt2 = (p3[0] + d2x*t, p3[1] + d2y*t)
+                return math.hypot(pt1[0]-pt2[0], pt1[1]-pt2[1]), pt1, pt2
+
+            # =====================================================================
+            # GLOBAL DIRECT MINIMUM SEARCH — exact, grid-independent closest-point
+            # search between HV+ and HV- boundaries on each layer, for the case
+            # where no obstacle wrapping is needed at all. The main A*+smoothing
+            # pipeline is grid-quantized (res_iu resolution) even though its
+            # endpoints get snapped onto the true boundary afterward — the CHOICE
+            # of which boundary region to snap from is still limited by that
+            # grid, so a true global minimum sitting between two grid steps can
+            # be missed by a few microns. This checks every HV+/HV- edge pair on
+            # the same layer directly (already-tessellated exact edges, so this
+            # is exact down to the tessellation tolerance, not the grid
+            # resolution) and takes it if it's shorter and has a clear line of
+            # sight (no obstacle actually requires routing around).
+            # =====================================================================
+            direct_best_mm = None
+            direct_best_pts = None  # (layer, pt_a, pt_b)
+            for layer in enabled_copper_layers:
+                hvp_edges_l = hvp_edges_by_layer.get(layer, [])
+                hvm_edges_l = hvm_edges_by_layer.get(layer, [])
+                if not hvp_edges_l or not hvm_edges_l:
+                    continue
+                best_d_l, best_pts_l, best_raw_edges_l = float('inf'), None, None
+                for (ax1, ay1, ax2, ay2) in hvp_edges_l:
+                    for (bx1, by1, bx2, by2) in hvm_edges_l:
+                        d, pa, pb = _seg_seg_closest((ax1, ay1), (ax2, ay2), (bx1, by1), (bx2, by2))
+                        if d < best_d_l:
+                            best_d_l, best_pts_l = d, (pa, pb)
+                            best_raw_edges_l = ((ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2))
+                if best_pts_l is not None:
+                    pa, pb = best_pts_l
+                    if _tuple_los(pa, pb):
+                        d_mm = pcbnew.ToMM(int(round(best_d_l)))
+                        if direct_best_mm is None or d_mm < direct_best_mm:
+                            direct_best_mm = d_mm
+                            direct_best_pts = (layer, pa, pb)
+                            (rax1, ray1, rax2, ray2), (rbx1, rby1, rbx2, rby2) = best_raw_edges_l
+                            diag_lines.append(f"Global direct search candidate: {d_mm:.4f}mm on "
+                                               f"{board.GetLayerName(layer)} (clear line of sight, no obstacle)")
+                            diag_lines.append(f"  winning HV+ edge (raw, mm): "
+                                               f"({pcbnew.ToMM(rax1):.6f},{pcbnew.ToMM(ray1):.6f}) -> "
+                                               f"({pcbnew.ToMM(rax2):.6f},{pcbnew.ToMM(ray2):.6f})")
+                            diag_lines.append(f"  winning HV- edge (raw, mm): "
+                                               f"({pcbnew.ToMM(rbx1):.6f},{pcbnew.ToMM(rby1):.6f}) -> "
+                                               f"({pcbnew.ToMM(rbx2):.6f},{pcbnew.ToMM(rby2):.6f})")
+                            diag_lines.append(f"  closest point HV+ side (mm): "
+                                               f"({pcbnew.ToMM(int(round(pa[0]))):.6f},{pcbnew.ToMM(int(round(pa[1]))):.6f}) "
+                                               f"| HV- side (mm): "
+                                               f"({pcbnew.ToMM(int(round(pb[0]))):.6f},{pcbnew.ToMM(int(round(pb[1]))):.6f})")
+
+            t5b = time.time()
+            diag_lines.append(f"Timing - Global direct search: {t5b-t5:.2f}s")
+
             # VIA-CONDUCTOR SHORTCUT SEARCH
             # IEC creepage rule: when a conductive part (third net, e.g. GND) sits between
             # two HV conductors, the surface path goes TO the conductor edge (normal surface
@@ -1592,43 +1745,6 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             via_cond_path_pts = None  # (vc_layer, hvm_boundary, cond_entry, cond_exit, hvp_boundary)
 
             if conductor_polys_by_layer:
-                def _seg_seg_closest(p1, p2, p3, p4):
-                    # Exact closest points between two finite line segments (p1-p2)
-                    # and (p3-p4). Unlike sampling only polygon VERTICES against the
-                    # other boundary, this finds the true analytic minimum anywhere
-                    # along both edges — needed because the GND zone's filled-polygon
-                    # outline is a coarse tessellation, and the true closest point on
-                    # its boundary to an HV edge generally falls between two of its
-                    # vertices, not on one of them.
-                    d1x, d1y = p2[0]-p1[0], p2[1]-p1[1]
-                    d2x, d2y = p4[0]-p3[0], p4[1]-p3[1]
-                    rx, ry = p1[0]-p3[0], p1[1]-p3[1]
-                    a = d1x*d1x + d1y*d1y
-                    e = d2x*d2x + d2y*d2y
-                    f = d2x*rx + d2y*ry
-                    if a <= 1e-9 and e <= 1e-9:
-                        s = t = 0.0
-                    elif a <= 1e-9:
-                        s = 0.0
-                        t = max(0.0, min(1.0, f/e))
-                    else:
-                        c = d1x*rx + d1y*ry
-                        if e <= 1e-9:
-                            t = 0.0
-                            s = max(0.0, min(1.0, -c/a))
-                        else:
-                            b = d1x*d2x + d1y*d2y
-                            denom = a*e - b*b
-                            s = max(0.0, min(1.0, (b*f - c*e)/denom)) if denom != 0 else 0.0
-                            t = (b*s + f) / e
-                            if t < 0.0:
-                                t = 0.0; s = max(0.0, min(1.0, -c/a))
-                            elif t > 1.0:
-                                t = 1.0; s = max(0.0, min(1.0, (b - c)/a))
-                    pt1 = (p1[0] + d1x*s, p1[1] + d1y*s)
-                    pt2 = (p3[0] + d2x*t, p3[1] + d2y*t)
-                    return math.hypot(pt1[0]-pt2[0], pt1[1]-pt2[1]), pt1, pt2
-
                 for vc_layer in enabled_copper_layers:
                     if vc_layer not in conductor_polys_by_layer: continue
                     hvp_l_vc = hvp_edges_by_layer.get(vc_layer, [])
@@ -1669,29 +1785,46 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                                                    f"(d_HVM={pcbnew.ToMM(int(round(best_d_hvm_vc))):.4f}mm, "
                                                    f"d_HVP={pcbnew.ToMM(int(round(best_d_hvp_vc))):.4f}mm)")
 
-            # Apply via-conductor shortcut if it's the shortest path found
-            used_via_conductor = False
-            if via_cond_best_mm is not None:
-                # Compare against what the main pathfinder found so far
-                curr_direct_mm = 0.0
-                for k in range(len(smoothed_path)-1):
-                    p1t, p2t = smoothed_path[k], smoothed_path[k+1]
-                    if p1t.layer == p2t.layer:
-                        curr_direct_mm += math.hypot(pcbnew.ToMM(p2t.x-p1t.x), pcbnew.ToMM(p2t.y-p1t.y))
-                    else:
-                        curr_direct_mm += layer_gap_mm(p1t.layer, p2t.layer)
-                if via_cond_best_mm < curr_direct_mm - 0.001:
-                    diag_lines.append(f"Via-conductor wins: {via_cond_best_mm:.4f}mm < direct {curr_direct_mm:.4f}mm — using conductor shortcut path")
-                    vc_l, hvm_pt_vc, hvm_cpt_vc, hvp_cpt_vc, hvp_pt_vc = via_cond_path_pts
-                    smoothed_path = [
-                        PathPoint(vc_l, hvm_pt_vc[0], hvm_pt_vc[1], False, False),         # HV- boundary
-                        PathPoint(vc_l, hvm_cpt_vc[0], hvm_cpt_vc[1], False, True),         # conductor entry (0mm transit starts)
-                        PathPoint(vc_l, hvp_cpt_vc[0], hvp_cpt_vc[1], False, True),         # conductor exit  (0mm transit ends)
-                        PathPoint(vc_l, hvp_pt_vc[0], hvp_pt_vc[1], False, False),           # HV+ boundary
-                    ]
-                    used_via_conductor = True
+            # Pick the shortest of: the main A*+tangent+global-arc-optimizer path,
+            # the via-conductor shortcut, and the new exact direct search — each
+            # targets a different scenario (detour required, third-net conductor
+            # shortcut, clear line of sight) and only one will actually apply for
+            # any given board, but whichever is genuinely shortest wins.
+            curr_direct_mm = 0.0
+            for k in range(len(smoothed_path)-1):
+                p1t, p2t = smoothed_path[k], smoothed_path[k+1]
+                if p1t.layer == p2t.layer:
+                    curr_direct_mm += math.hypot(pcbnew.ToMM(p2t.x-p1t.x), pcbnew.ToMM(p2t.y-p1t.y))
                 else:
-                    diag_lines.append(f"Via-conductor ({via_cond_best_mm:.4f}mm) not shorter than direct path ({curr_direct_mm:.4f}mm)")
+                    curr_direct_mm += layer_gap_mm(p1t.layer, p2t.layer)
+
+            used_via_conductor = False
+            if via_cond_best_mm is not None and via_cond_best_mm < curr_direct_mm - 0.001:
+                diag_lines.append(f"Via-conductor wins: {via_cond_best_mm:.4f}mm < direct {curr_direct_mm:.4f}mm — using conductor shortcut path")
+                vc_l, hvm_pt_vc, hvm_cpt_vc, hvp_cpt_vc, hvp_pt_vc = via_cond_path_pts
+                smoothed_path = [
+                    PathPoint(vc_l, hvm_pt_vc[0], hvm_pt_vc[1], False, False),         # HV- boundary
+                    PathPoint(vc_l, hvm_cpt_vc[0], hvm_cpt_vc[1], False, True),         # conductor entry (0mm transit starts)
+                    PathPoint(vc_l, hvp_cpt_vc[0], hvp_cpt_vc[1], False, True),         # conductor exit  (0mm transit ends)
+                    PathPoint(vc_l, hvp_pt_vc[0], hvp_pt_vc[1], False, False),           # HV+ boundary
+                ]
+                used_via_conductor = True
+                curr_direct_mm = via_cond_best_mm
+            elif via_cond_best_mm is not None:
+                diag_lines.append(f"Via-conductor ({via_cond_best_mm:.4f}mm) not shorter than direct path ({curr_direct_mm:.4f}mm)")
+
+            if direct_best_mm is not None and direct_best_mm < curr_direct_mm - 0.001:
+                diag_lines.append(f"Global direct search wins: {direct_best_mm:.4f}mm < {curr_direct_mm:.4f}mm — "
+                                   f"replacing with the exact closest-point path (this bypasses grid-resolution "
+                                   f"limits the main A* search is subject to)")
+                d_layer, d_pa, d_pb = direct_best_pts
+                smoothed_path = [
+                    PathPoint(d_layer, d_pa[0], d_pa[1], False),
+                    PathPoint(d_layer, d_pb[0], d_pb[1], False),
+                ]
+                used_via_conductor = False
+            elif direct_best_mm is not None:
+                diag_lines.append(f"Global direct search ({direct_best_mm:.4f}mm) not shorter than current best ({curr_direct_mm:.4f}mm)")
 
             final_distance_mm = 0.0
             z_transition_notes = []
@@ -1834,7 +1967,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             if required_creepage_mm is not None:
                 margin_mm = final_distance_mm - required_creepage_mm
                 verdict_word = "PASS" if margin_mm >= 0 else "FAIL"
-                lines.append(f"IEC REQUIRED: {required_creepage_mm:.3f} mm")
+                lines.append(f"REQUIRED: {required_creepage_mm:.3f} mm")
                 lines.append(f"{verdict_word} (margin {margin_mm:+.3f} mm)")
             self.draw_text(board, comment_layer, "\n".join(lines), pos)
             diag_lines.append(f"Final measured distance: {final_distance_mm:.3f} mm")
@@ -1876,6 +2009,20 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         grid.Add(choice_b, 1, wx.EXPAND)
 
         vbox.Add(grid, 0, wx.ALL | wx.EXPAND, 12)
+
+        refill_check = wx.CheckBox(panel, label=(
+            "Refill net A/B zones before measuring (only these two nets — "
+            "never touches any other net's zones)"))
+        refill_check.SetValue(False)
+        vbox.Add(refill_check, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        refill_note = wx.StaticText(panel, label=(
+            "Off by default: forcing a zone fill is a real edit to the board and can\n"
+            "surface unrelated fill-time conflicts, which some HV designs deliberately\n"
+            "avoid mid-layout. Leave unchecked and refill manually first if that matters\n"
+            "to you; check this only if you want current geometry guaranteed."))
+        refill_note.Wrap(420)
+        vbox.Add(refill_note, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
         vbox.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
 
         source_label = wx.StaticText(panel, label=(
@@ -2003,6 +2150,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 "pollution_degree": pollution_degree,
                 "material_group": mg_choice.GetStringSelection(),
                 "use_pwb": use_pwb,
+                "refill_ab_zones": refill_check.GetValue(),
             }
             break
 
