@@ -51,6 +51,20 @@ Known limitation (not a bug): sub-tolerance positional offset (not distance erro
 
 ## Changelog
 
+### v189.0
+Major architecture change: spatial indexing
+Problem: on a complex real board (3,834 obstacles, vs. 2–295 on earlier test boards), every core geometry lookup — grid cell classification, line-of-sight checks, via-conductor edge search — worked by linearly scanning the entire relevant list with bounding-box pre-checks. That scales fine into the hundreds of items; at thousands, combined with pathfinding visiting millions of grid cells, it becomes billions of comparisons. Confirmed via profiling: 49 minutes total runtime on a real board, with via-conductor search alone consuming 30 minutes for just 6 non-pruned conductors.
+Fix: every obstacle, hole edge, and HV edge now gets bucketed into a coarse 2mm spatial grid once, up front. A lookup for "what's near this point" now only checks items in the relevant bucket(s) instead of the full list. Applied in three places:
+
+get_grid_mask — pathfinding's per-cell obstacle classification (was the largest single cost by raw multiplication: obstacle count × cells evaluated)
+_tuple_los / exact_los — visibility checks, previously scanning all of exact_hole_edges on every call; fires heavily inside the via-conductor search
+Via-conductor search's HV-edge lookup — bucketed per copper layer, queried with a margin equal to the current best-known distance (a safe bound, not an approximation — any HV edge farther away provably can't win)
+
+Measured result on a real 3,834-obstacle board (identical net pair, before/after):
+Stagev188.11v189.0SpeedupVia-conductor search1817.81s1.66s~1095xPathfinding1095.73s192.70s~5.7xTotal2949.93s (49 min)229.94s (3.8 min)~12.8x
+Correctness: result confirmed identical (8.009mm) before and after — the indexing changes how candidates are found, not the answer. This matters because spatial indexing is exactly the kind of change that could silently miss a valid candidate if implemented incorrectly; getting the same number is the evidence it didn't.
+Remaining bottleneck: pathfinding is now ~84% of total runtime (still visiting the same 2,944,472 cells as before — this change made classifying each cell faster, not the search itself smaller). That's the next target.
+
 ### v188.9–v188.11
 Progress dialog polish
 Replaced iteration-count-gated pulses (silently stopped updating entirely whenever a stage had fewer iterations than the gate threshold) with a wall-clock time throttle inside _progress() itself

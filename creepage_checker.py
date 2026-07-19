@@ -22,7 +22,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
     def Run(self):
         t0 = time.time()
         board = pcbnew.GetBoard()
-        BUILD_VERSION = "v188.11"
+        BUILD_VERSION = "v189.0"
 
         # =====================================================================
         # NET SELECTION + IEC 60664-1 PARAMETER DIALOG
@@ -933,6 +933,78 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
             obstacle_bboxes.append((min(xs), min(ys), max(xs), max(ys)))
 
+        # =====================================================================
+        # SPATIAL INDEX — on a simple board (a couple hundred obstacles) the
+        # per-cell linear scan below over obstacle_bboxes was cheap. On a real
+        # complex board (thousands of pads/zones/holes -> thousands of
+        # obstacles), that same scan run against every one of the millions of
+        # cells pathfinding actually visits becomes billions of comparisons —
+        # confirmed as the dominant cost via profiling (2.9M cells x thousands
+        # of obstacles). This buckets every obstacle into a coarse grid ONCE;
+        # a cell lookup then only needs to check the handful of obstacles
+        # whose bounding box actually overlaps that bucket, not all of them.
+        # =====================================================================
+        SPATIAL_BUCKET_IU = pcbnew.FromMM(2.0)
+
+        def _bucket_of(x, y):
+            return (int(x // SPATIAL_BUCKET_IU), int(y // SPATIAL_BUCKET_IU))
+
+        def _build_bucket_index(bboxes):
+            index = {}
+            for idx, (bx1, by1, bx2, by2) in enumerate(bboxes):
+                bxlo, bylo = _bucket_of(bx1, by1)
+                bxhi, byhi = _bucket_of(bx2, by2)
+                for bxi in range(bxlo, bxhi + 1):
+                    for byi in range(bylo, byhi + 1):
+                        index.setdefault((bxi, byi), []).append(idx)
+            return index
+
+        obstacle_spatial_index = _build_bucket_index(obstacle_bboxes)
+
+        def _obstacle_candidates_near(x, y):
+            return obstacle_spatial_index.get(_bucket_of(x, y), ())
+
+        def _obstacle_candidates_in_region(x, y, margin):
+            # 3x3 neighborhood is always sufficient as long as margin < bucket
+            # size (2mm here) — every margin used anywhere in this file is a
+            # small fraction of a mm, so this has plenty of headroom.
+            bx0, by0 = _bucket_of(x, y)
+            seen = set()
+            out = []
+            for dbx in (-1, 0, 1):
+                for dby in (-1, 0, 1):
+                    for idx in obstacle_spatial_index.get((bx0 + dbx, by0 + dby), ()):
+                        if idx not in seen:
+                            seen.add(idx)
+                            out.append(idx)
+            return out
+
+        # exact_hole_edges gets scanned on every LOS check (segments_proper_intersect
+        # against every edge) — same problem as obstacle_polygons above, and this list
+        # is often even larger (every obstacle contributes multiple edges). LOS checks
+        # fire heavily inside the via-conductor search's inner loop, so this indexing
+        # matters just as much there as get_grid_mask's did for pathfinding.
+        hole_edge_bboxes = []
+        for (ex1, ey1, ex2, ey2) in exact_hole_edges:
+            hole_edge_bboxes.append((min(ex1, ex2), min(ey1, ey2), max(ex1, ex2), max(ey1, ey2)))
+        hole_edge_spatial_index = _build_bucket_index(hole_edge_bboxes)
+
+        def _hole_edge_candidates_for_segment(x1, y1, x2, y2):
+            # Candidates from every bucket the query segment's own bounding box
+            # spans — correct for segments of any length, from a short local
+            # tangent-correction hop to a long global-direct-search line.
+            bxlo, bylo = _bucket_of(min(x1, x2), min(y1, y2))
+            bxhi, byhi = _bucket_of(max(x1, x2), max(y1, y2))
+            seen = set()
+            out = []
+            for bxi in range(bxlo, bxhi + 1):
+                for byi in range(bylo, byhi + 1):
+                    for idx in hole_edge_spatial_index.get((bxi, byi), ()):
+                        if idx not in seen:
+                            seen.add(idx)
+                            out.append(idx)
+            return out
+
         # Build lookup of all analytic arc definitions (in IU) — used during
         # visualization to draw the hugged portion as a true arc instead of
         # connecting coarse polygon-ring points with straight segments.
@@ -1037,7 +1109,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 if bbox.Contains(pt) and pad.HitTest(pt): inside = True; break
 
             if not inside:
-                for idx, poly in enumerate(obstacle_polygons):
+                for idx in _obstacle_candidates_near(real_x, real_y):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx]
                     if bx1 <= real_x <= bx2 and by1 <= real_y <= by2:
                         if point_in_obstacle(real_x, real_y, idx): inside = True; break
@@ -1188,7 +1260,8 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
             def find_obstacle_index(px, py, tol):
                 best_idx, best_d = None, float('inf')
-                for idx, poly in enumerate(obstacle_polygons):
+                for idx in _obstacle_candidates_in_region(px, py, tol):
+                    poly = obstacle_polygons[idx]
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx]
                     margin = tol
                     if not (bx1-margin <= px <= bx2+margin and by1-margin <= py <= by2+margin):
@@ -1220,13 +1293,14 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 tx2, ty2 = x2-ux*trim, y2-uy*trim
                 seg_min_x, seg_max_x = (tx1, tx2) if tx1 <= tx2 else (tx2, tx1)
                 seg_min_y, seg_max_y = (ty1, ty2) if ty1 <= ty2 else (ty2, ty1)
-                for (ex1, ey1, ex2, ey2) in exact_hole_edges:
+                for _hidx in _hole_edge_candidates_for_segment(tx1, ty1, tx2, ty2):
+                    ex1, ey1, ex2, ey2 = exact_hole_edges[_hidx]
                     if (ex1 < seg_min_x and ex2 < seg_min_x) or (ex1 > seg_max_x and ex2 > seg_max_x): continue
                     if (ey1 < seg_min_y and ey2 < seg_min_y) or (ey1 > seg_max_y and ey2 > seg_max_y): continue
                     if segments_proper_intersect(tx1, ty1, tx2, ty2, ex1, ey1, ex2, ey2):
                         return False
                 mx, my = (tx1+tx2)/2.0, (ty1+ty2)/2.0
-                for idx2, poly2 in enumerate(obstacle_polygons):
+                for idx2 in _obstacle_candidates_near(mx, my):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx2]
                     if not (bx1 <= mx <= bx2 and by1 <= my <= by2): continue
                     if point_in_obstacle(mx, my, idx2):
@@ -1316,13 +1390,14 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 tx2, ty2 = x2-ux*trim, y2-uy*trim
                 seg_min_x, seg_max_x = (tx1, tx2) if tx1 <= tx2 else (tx2, tx1)
                 seg_min_y, seg_max_y = (ty1, ty2) if ty1 <= ty2 else (ty2, ty1)
-                for (ex1, ey1, ex2, ey2) in exact_hole_edges:
+                for _hidx in _hole_edge_candidates_for_segment(tx1, ty1, tx2, ty2):
+                    ex1, ey1, ex2, ey2 = exact_hole_edges[_hidx]
                     if (ex1 < seg_min_x and ex2 < seg_min_x) or (ex1 > seg_max_x and ex2 > seg_max_x): continue
                     if (ey1 < seg_min_y and ey2 < seg_min_y) or (ey1 > seg_max_y and ey2 > seg_max_y): continue
                     if segments_proper_intersect(tx1, ty1, tx2, ty2, ex1, ey1, ex2, ey2):
                         return False
                 mx, my = (tx1+tx2)/2.0, (ty1+ty2)/2.0
-                for idx, poly in enumerate(obstacle_polygons):
+                for idx in _obstacle_candidates_near(mx, my):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx]
                     if not (bx1 <= mx <= bx2 and by1 <= my <= by2): continue
                     if point_in_obstacle(mx, my, idx):
@@ -1906,6 +1981,21 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
                     hvm_edges_bb_vc = [_edge_bbox(e) for e in hvm_l_vc]
                     hvp_edges_bb_vc = [_edge_bbox(e) for e in hvp_l_vc]
+                    hvm_spatial_vc = _build_bucket_index(hvm_edges_bb_vc)
+                    hvp_spatial_vc = _build_bucket_index(hvp_edges_bb_vc)
+
+                    def _hv_candidates_for(spatial_idx, g_bbox, margin_iu):
+                        bxlo, bylo = _bucket_of(g_bbox[0] - margin_iu, g_bbox[1] - margin_iu)
+                        bxhi, byhi = _bucket_of(g_bbox[2] + margin_iu, g_bbox[3] + margin_iu)
+                        seen = set()
+                        out = []
+                        for bxi in range(bxlo, bxhi + 1):
+                            for byi in range(bylo, byhi + 1):
+                                for idx in spatial_idx.get((bxi, byi), ()):
+                                    if idx not in seen:
+                                        seen.add(idx)
+                                        out.append(idx)
+                        return out
 
                     for vc_poly in conductor_polys_by_layer[vc_layer]:
                         # Best possible via-conductor total is bounded below by the
@@ -1955,12 +2045,14 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         for _ei, ((g1, g2), g_bbox) in enumerate(vc_edges):
                             if _ei % 50 == 0:
                                 _progress(f"Via search: conductor {_examined_conductors}, edge {_ei}/{len(vc_edges)}")
-                            for hi, (hx1, hy1, hx2, hy2) in enumerate(hvm_l_vc):
+                            for hi in _hv_candidates_for(hvm_spatial_vc, g_bbox, best_so_far_iu):
+                                hx1, hy1, hx2, hy2 = hvm_l_vc[hi]
                                 if _bbox_gap(g_bbox, hvm_edges_bb_vc[hi]) >= best_d_hvm_vc: continue
                                 dist, gpt, hpt = _seg_seg_closest(g1, g2, (hx1, hy1), (hx2, hy2))
                                 if dist < best_d_hvm_vc and _tuple_los(hpt, gpt):
                                     best_d_hvm_vc, best_hvm_pt_vc, best_hvm_cpt = dist, hpt, gpt
-                            for hi, (hx1, hy1, hx2, hy2) in enumerate(hvp_l_vc):
+                            for hi in _hv_candidates_for(hvp_spatial_vc, g_bbox, best_so_far_iu):
+                                hx1, hy1, hx2, hy2 = hvp_l_vc[hi]
                                 if _bbox_gap(g_bbox, hvp_edges_bb_vc[hi]) >= best_d_hvp_vc: continue
                                 dist, gpt, hpt = _seg_seg_closest(g1, g2, (hx1, hy1), (hx2, hy2))
                                 if dist < best_d_hvp_vc and _tuple_los(gpt, hpt):
