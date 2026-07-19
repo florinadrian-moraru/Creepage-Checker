@@ -22,7 +22,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
     def Run(self):
         t0 = time.time()
         board = pcbnew.GetBoard()
-        BUILD_VERSION = "v189.0"
+        BUILD_VERSION = "v189.5"
 
         # =====================================================================
         # NET SELECTION + IEC 60664-1 PARAMETER DIALOG
@@ -589,7 +589,8 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         # and segment-intersection test.
         # =====================================================================
         obstacle_polygons = []
-        obstacle_kind = []  # parallel to obstacle_polygons: 'npth' / 'slot_or_edge' / 'third_net' — used to tag
+        obstacle_kind = []  # parallel to obstacle_polygons: 'npth' / 'slot_or_edge' / 'third_net_via' /
+                             # 'third_net_pad' / 'third_net_zone' — used to tag
                              # each Z-transition in the path with what kind of exposed discontinuity it passes
                              # through, so pollution-degree judgment calls (coating exposure, slot walls, etc.)
                              # can be made with the facts in hand rather than the tool guessing at compliance.
@@ -661,7 +662,14 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                             ring.append((p1h.x, p1h.y))
                         if len(ring) >= 3:
                             obstacle_polygons.append(ring)
-                            obstacle_kind.append('third_net')
+                            # A through-hole (PTH) pad has a real drilled hole passing
+                            # through the board, physically justifying a layer
+                            # transition there — same as a via. A surface-mount pad
+                            # does not: it's just copper on specific layers, and
+                            # being near it is no more a physical connection between
+                            # layers than any other patch of third-net copper.
+                            _is_pth_pad = pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH
+                            obstacle_kind.append('third_net_via' if _is_pth_pad else 'third_net_pad')
                             obstacle_holes.append([])
                             conductor_polys_by_layer.setdefault(pad_layer, []).append(ring)
                             _pad_added = True
@@ -694,7 +702,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         x1, y1 = ring[i]; x2, y2 = ring[(i + 1) % len(ring)]
                         exact_hole_edges.append((x1, y1, x2, y2))
                     obstacle_polygons.append(ring)
-                    obstacle_kind.append('third_net')
+                    obstacle_kind.append('third_net_via')
                     obstacle_holes.append([])
         # Zones belonging to neither net A nor net B (e.g. a GND pour, possibly
         # on an inner layer) are real filled copper, so the surface path must
@@ -746,7 +754,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                             if len(hole_ring) >= 3:
                                 holes_for_ring.append(hole_ring)
                         obstacle_polygons.append(ring)
-                        obstacle_kind.append('third_net')
+                        obstacle_kind.append('third_net_zone')
                         obstacle_holes.append(holes_for_ring)
                         conductor_polys_by_layer.setdefault(layer, []).append(ring)
                         _other_zone_count += 1
@@ -1079,6 +1087,83 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         npth_pad_bboxes = [(p, p.GetBoundingBox()) for p in npth_pads]
         edge_cuts_bboxes = [(d, d.GetBoundingBox()) for d in edge_cuts if hasattr(d, "HitTest")]
 
+        # These were STILL a full linear scan inside get_grid_mask even after
+        # v189.0 indexed obstacle_polygons — profiling on a real board showed
+        # this was actually the dominant cost (260M Contains() calls, ~121s of
+        # a 386s profiled run): every first-time cell evaluation checked all
+        # 89 Edge.Cuts shapes unconditionally. Same fix, same pattern.
+        def _bbox_obj_to_tuple(bbox_obj):
+            return (bbox_obj.GetX(), bbox_obj.GetY(), bbox_obj.GetRight(), bbox_obj.GetBottom())
+
+        npth_pad_bbox_tuples = [_bbox_obj_to_tuple(bbox) for _, bbox in npth_pad_bboxes]
+        edge_cuts_bbox_tuples = [_bbox_obj_to_tuple(bbox) for _, bbox in edge_cuts_bboxes]
+        npth_pad_spatial_index = _build_bucket_index(npth_pad_bbox_tuples)
+        edge_cuts_spatial_index = _build_bucket_index(edge_cuts_bbox_tuples)
+
+        # =====================================================================
+        # TRANSITION-PERMITTING OBSTACLES ONLY — a layer change ("Z-transition")
+        # in the main pathfinding loop is only physically valid where something
+        # actually connects those layers: an NPTH hole, a slot/board-edge cut
+        # all the way through, a via, or a through-hole (PTH) pad — all of
+        # these have a real drilled/milled hole passing through the board. A
+        # third-net PAD (SMD) or ZONE is just copper sitting on specific
+        # layers — being near one is no more a physical connection between
+        # layers than any other patch of copper is. Treating ANY nearby
+        # obstacle as license to jump layers (the previous behavior) could
+        # silently produce a short, physically-nonexistent shortcut — the
+        # unsafe direction of error for a clearance tool. This indexes only
+        # the subset of obstacle_polygons that genuinely represents a
+        # through-board discontinuity.
+        # =====================================================================
+        _transition_permitting_kinds = {'npth', 'slot_or_edge', 'third_net_via'}
+        transition_obstacle_global_indices = [
+            idx for idx in range(len(obstacle_polygons))
+            if obstacle_kind[idx] in _transition_permitting_kinds
+        ]
+        _transition_bboxes_only = [obstacle_bboxes[idx] for idx in transition_obstacle_global_indices]
+        _transition_local_index = _build_bucket_index(_transition_bboxes_only)
+
+        def _transition_obstacle_candidates_near(x, y):
+            return [transition_obstacle_global_indices[li]
+                    for li in _transition_local_index.get(_bucket_of(x, y), ())]
+
+        transition_mask_cache = {}
+
+        def get_transition_mask(r, c):
+            # True if (r,c) sits inside a transition-permitting obstacle —
+            # i.e. this XY location has a real hole/cut passing through the
+            # board here, regardless of which two layers are being considered.
+            if r < 0 or r >= rows or c < 0 or c >= cols:
+                return False
+            key = (r, c)
+            cached = transition_mask_cache.get(key)
+            if cached is not None:
+                return cached
+            real_x = int(round((grid_min_c + c) * res_iu))
+            real_y = int(round((grid_min_r + r) * res_iu))
+            pt = pcbnew.VECTOR2I(real_x, real_y)
+            bxi, byi = _bucket_of(real_x, real_y)
+            bucket_key = (bxi, byi)
+            inside = False
+
+            for idx in npth_pad_spatial_index.get(bucket_key, ()):
+                pad, bbox = npth_pad_bboxes[idx]
+                if bbox.Contains(pt) and pad.HitTest(pt): inside = True; break
+
+            if not inside:
+                for idx in _transition_obstacle_candidates_near(real_x, real_y):
+                    bx1, by1, bx2, by2 = obstacle_bboxes[idx]
+                    if bx1 <= real_x <= bx2 and by1 <= real_y <= by2:
+                        if point_in_obstacle(real_x, real_y, idx): inside = True; break
+
+            if not inside:
+                for idx in edge_cuts_spatial_index.get(bucket_key, ()):
+                    dwg, bbox = edge_cuts_bboxes[idx]
+                    if bbox.Contains(pt) and dwg.HitTest(pt, int(res_iu)): inside = True; break
+
+            transition_mask_cache[key] = inside
+            return inside
+
         t3 = time.time()
         diag_lines.append(f"Timing - Obstacle extraction + stitching: {t3-t2:.2f}s")
         _progress("Pathfinding (often the slowest stage)...", force=True)
@@ -1105,7 +1190,11 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             pt = pcbnew.VECTOR2I(real_x, real_y)
             inside = False
 
-            for pad, bbox in npth_pad_bboxes:
+            bxi, byi = _bucket_of(real_x, real_y)
+            bucket_key = (bxi, byi)
+
+            for idx in npth_pad_spatial_index.get(bucket_key, ()):
+                pad, bbox = npth_pad_bboxes[idx]
                 if bbox.Contains(pt) and pad.HitTest(pt): inside = True; break
 
             if not inside:
@@ -1115,17 +1204,51 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         if point_in_obstacle(real_x, real_y, idx): inside = True; break
 
             if not inside:
-                for dwg, bbox in edge_cuts_bboxes:
+                for idx in edge_cuts_spatial_index.get(bucket_key, ()):
+                    dwg, bbox = edge_cuts_bboxes[idx]
                     if bbox.Contains(pt) and dwg.HitTest(pt, int(res_iu)): inside = True; break
 
             val = -1 if inside else 0
             grid_mask_cache[key] = val
             return val
 
+        is_portal_cache = {}
+
         def get_is_portal(r, c):
-            if get_grid_mask(r, c) == -1: return False
-            return (get_grid_mask(r-1, c) == -1 or get_grid_mask(r+1, c) == -1 or
-                    get_grid_mask(r, c-1) == -1 or get_grid_mask(r, c+1) == -1)
+            key = (r, c)
+            cached = is_portal_cache.get(key)
+            if cached is not None:
+                return cached
+            if get_grid_mask(r, c) == -1:
+                val = False
+            else:
+                val = (get_grid_mask(r-1, c) == -1 or get_grid_mask(r+1, c) == -1 or
+                       get_grid_mask(r, c-1) == -1 or get_grid_mask(r, c+1) == -1)
+            is_portal_cache[key] = val
+            return val
+
+        is_transition_portal_cache = {}
+
+        def get_is_transition_portal(r, c):
+            # Stricter than get_is_portal: only true if (r,c) is free AND
+            # adjacent to a genuinely through-board discontinuity (NPTH, slot/
+            # edge, via, or PTH pad) — NOT just any obstacle. This is what
+            # gates layer transitions specifically; get_is_portal itself keeps
+            # its original meaning (adjacent to ANY obstacle) for the
+            # obstacle-hugging/snapping logic elsewhere, which is a different,
+            # already-correct concern about routing around copper, not about
+            # whether jumping layers is physically justified there.
+            key = (r, c)
+            cached = is_transition_portal_cache.get(key)
+            if cached is not None:
+                return cached
+            if get_grid_mask(r, c) == -1:
+                val = False
+            else:
+                val = (get_transition_mask(r-1, c) or get_transition_mask(r+1, c) or
+                       get_transition_mask(r, c-1) or get_transition_mask(r, c+1))
+            is_transition_portal_cache[key] = val
+            return val
 
         def near_hole(r, c):
             for dr in (-1, 0, 1):
@@ -1157,41 +1280,66 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 dist_matrix[(layer, r, c)] = 0.0
                 heapq.heappush(pq, (0.0, layer, r, c))
 
+        # Toggle on for one diagnostic run when investigating pathfinding
+        # performance specifically — adds real overhead (expect the reported
+        # pathfinding time to be inflated while this is on, often 30-100%),
+        # so leave off for normal use once the investigation is done.
+        PROFILE_PATHFINDING = False
+
         res_mm = pcbnew.ToMM(res_iu)
         _pf_iter = 0
-        while pq:
-            _pf_iter += 1
-            if _pf_iter % 200 == 0:
-                _progress(f"Pathfinding: {len(grid_mask_cache)} cells evaluated")
-            d, layer, r, c = heapq.heappop(pq)
-            if d > dist_matrix.get((layer, r, c), float('inf')): continue
-            if d >= global_min_dist: break
 
-            if (r, c) in target_cache.get(layer, set()):
-                global_min_dist = d
-                term_node, term_layer = (r, c), layer
-                break
+        def _run_pathfinding_loop():
+            nonlocal pq, global_min_dist, term_node, term_layer, _pf_iter
+            while pq:
+                _pf_iter += 1
+                if _pf_iter % 200 == 0:
+                    _progress(f"Pathfinding: {len(grid_mask_cache)} cells evaluated")
+                d, layer, r, c = heapq.heappop(pq)
+                if d > dist_matrix.get((layer, r, c), float('inf')): continue
+                if d >= global_min_dist: break
 
-            for dr, dc, weight in neighbor_offsets:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and get_grid_mask(nr, nc) != -1:
-                    nd = d + (weight * res_mm)
-                    key = (layer, nr, nc)
-                    if nd < dist_matrix.get(key, float('inf')):
-                        dist_matrix[key] = nd
-                        parent_matrix[key] = (layer, r, c)
-                        heapq.heappush(pq, (nd, layer, nr, nc))
+                if (r, c) in target_cache.get(layer, set()):
+                    global_min_dist = d
+                    term_node, term_layer = (r, c), layer
+                    break
 
-            if get_is_portal(r, c):
-                for next_layer in enabled_copper_layers:
-                    if next_layer != layer:
-                        dz = layer_gap_mm(layer, next_layer)
-                        nd_z = d + dz
-                        key = (next_layer, r, c)
-                        if nd_z < dist_matrix.get(key, float('inf')):
-                            dist_matrix[key] = nd_z
+                for dr, dc, weight in neighbor_offsets:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols and get_grid_mask(nr, nc) != -1:
+                        nd = d + (weight * res_mm)
+                        key = (layer, nr, nc)
+                        if nd < dist_matrix.get(key, float('inf')):
+                            dist_matrix[key] = nd
                             parent_matrix[key] = (layer, r, c)
-                            heapq.heappush(pq, (nd_z, next_layer, r, c))
+                            heapq.heappush(pq, (nd, layer, nr, nc))
+
+                if get_is_transition_portal(r, c):
+                    for next_layer in enabled_copper_layers:
+                        if next_layer != layer:
+                            dz = layer_gap_mm(layer, next_layer)
+                            nd_z = d + dz
+                            key = (next_layer, r, c)
+                            if nd_z < dist_matrix.get(key, float('inf')):
+                                dist_matrix[key] = nd_z
+                                parent_matrix[key] = (layer, r, c)
+                                heapq.heappush(pq, (nd_z, next_layer, r, c))
+
+        if PROFILE_PATHFINDING:
+            import cProfile, pstats, io
+            _profiler = cProfile.Profile()
+            _profiler.enable()
+            _run_pathfinding_loop()
+            _profiler.disable()
+            _stats_buf = io.StringIO()
+            _stats = pstats.Stats(_profiler, stream=_stats_buf).sort_stats('cumulative')
+            _stats.print_stats(20)
+            diag_lines.append("===== PATHFINDING PROFILE (top 20 by cumulative time; profiling itself "
+                               "adds overhead, so absolute times here are inflated vs. normal runs — "
+                               "the RELATIVE breakdown is what matters) =====")
+            diag_lines.append(_stats_buf.getvalue())
+        else:
+            _run_pathfinding_loop()
 
         t4 = time.time()
         diag_lines.append(f"Timing - Pathfinding: {t4-t3:.2f}s (cells evaluated: {len(grid_mask_cache)})")
@@ -1607,6 +1755,11 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 poly = obstacle_polygons[obs_idx]
                 n = len(poly)
                 bb = obstacle_bboxes[obs_idx]
+                # Cross-layer "duck straight through the wall" is only physically
+                # valid at obstacles with a real through-board discontinuity — see
+                # the matching restriction on the main pathfinding loop's
+                # Z-transitions for the full reasoning.
+                _obs_allows_transition = obstacle_kind[obs_idx] in _transition_permitting_kinds
 
                 seg_lens = [math.hypot(poly[(k+1)%n][0]-poly[k][0], poly[(k+1)%n][1]-poly[k][1]) for k in range(n)]
                 cum = [0.0]
@@ -1615,45 +1768,58 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 def arc_dist(i, j):
                     d1 = abs(cum[j]-cum[i]); return min(d1, perim-d1)
 
-                def closest_pt_on_edges_layered(px, py, edges_with_layer):
-                    # Returns (closest_point, distance, layer_id)
-                    best_d, best_pt, best_layer = float('inf'), None, None
+                def closest_pts_per_layer(px, py, edges_with_layer):
+                    # Returns {layer: (dist, pt)} — the closest point on EACH layer
+                    # separately, not collapsed to a single overall-best answer.
+                    # Collapsing to one layer was a real bug: if one layer happens
+                    # to have closer copper at a given vertex (e.g. because of an
+                    # extra track only routed on that layer), every OTHER layer's
+                    # equally-valid candidate at that same vertex was silently
+                    # discarded and never even entered into the search — even when
+                    # the underlying pad copper is identical on both layers.
+                    best = {}
                     for x1,y1,x2,y2,layer in edges_with_layer:
                         dx,dy = x2-x1, y2-y1; l2 = dx*dx+dy*dy
                         if l2 == 0: t = 0.0
                         else: t = max(0.0, min(1.0, ((px-x1)*dx+(py-y1)*dy)/l2))
                         cx,cy = x1+t*dx, y1+t*dy; d = math.hypot(px-cx,py-cy)
-                        if d < best_d: best_d, best_pt, best_layer = d, (cx, cy), layer
-                    return best_pt, best_d, best_layer
+                        if layer not in best or d < best[layer][0]:
+                            best[layer] = (d, (cx, cy))
+                    return best
 
                 best_total_iu = float('inf')
                 best_hvp = best_hvm = best_ei = best_ej = None
                 best_hvp_layer = best_hvm_layer = current_layer
 
-                hvp_dists = []
-                hvm_dists = []
+                hvp_dists_by_vertex = []
+                hvm_dists_by_vertex = []
                 for k in range(n):
                     px, py = poly[k]
-                    hvp_pt, d_hvp, hvp_l = closest_pt_on_edges_layered(px, py, exact_hvp_edges_layered)
-                    hvm_pt, d_hvm, hvm_l = closest_pt_on_edges_layered(px, py, exact_hvm_edges_layered)
-                    hvp_dists.append((d_hvp, hvp_pt, hvp_l))
-                    hvm_dists.append((d_hvm, hvm_pt, hvm_l))
+                    hvp_dists_by_vertex.append(closest_pts_per_layer(px, py, exact_hvp_edges_layered))
+                    hvm_dists_by_vertex.append(closest_pts_per_layer(px, py, exact_hvm_edges_layered))
 
-                entry_cands = sorted(((hvp_dists[k][0], k) for k in range(n)), key=lambda x: x[0])
-                exit_cands  = sorted(((hvm_dists[k][0], k) for k in range(n)), key=lambda x: x[0])
+                entry_cands = sorted(
+                    ((d, k, layer) for k in range(n) for layer, (d, pt) in hvp_dists_by_vertex[k].items()),
+                    key=lambda x: x[0])
+                exit_cands = sorted(
+                    ((d, k, layer) for k in range(n) for layer, (d, pt) in hvm_dists_by_vertex[k].items()),
+                    key=lambda x: x[0])
 
-                for entry_d, ei in entry_cands:
+                for entry_d, ei, hvp_l in entry_cands:
                     if entry_d >= best_total_iu: break
-                    hvp_pt = hvp_dists[ei][1]; hvp_l = hvp_dists[ei][2]
+                    hvp_pt = hvp_dists_by_vertex[ei][hvp_l][1]
                     if hvp_pt is None or not _tuple_los(hvp_pt, poly[ei]): continue
-                    for exit_d, ej in exit_cands:
+                    for exit_d, ej, hvm_l in exit_cands:
                         # Same-layer: must traverse arc around obstacle, so ei==ej invalid.
-                        # Cross-layer: path drops straight through the slot wall at a single
-                        # XY point — zero 2D arc traversal — so ei==ej is geometrically correct.
-                        if hvp_l == hvm_dists[ej][2] and ei == ej: continue
+                        # Cross-layer: path drops straight through the wall at a single
+                        # XY point — zero 2D arc traversal — so ei==ej is geometrically
+                        # correct, but ONLY when this obstacle actually has a real
+                        # through-board hole/cut there (see _obs_allows_transition).
+                        if hvp_l == hvm_l and ei == ej: continue
+                        if hvp_l != hvm_l and not _obs_allows_transition: continue
                         if entry_d + exit_d >= best_total_iu: break
                         ad = arc_dist(ei, ej)  # = 0 when ei == ej (as intended for cross-layer)
-                        hvm_pt = hvm_dists[ej][1]; hvm_l = hvm_dists[ej][2]
+                        hvm_pt = hvm_dists_by_vertex[ej][hvm_l][1]
                         if hvm_pt is None: continue
                         z_iu = pcbnew.FromMM(layer_gap_mm(hvp_l, hvm_l)) if hvp_l != hvm_l else 0
                         total = entry_d + ad + z_iu + exit_d
@@ -1771,15 +1937,24 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                     best_arc = cand_f if polyline_length(cand_f) <= polyline_length(cand_b) else cand_b
                 return best_total_iu, (best_arc, best_hvp_layer, best_hvm_layer, best_ei, best_ej)
 
-            # Find which obstacles appear in the smoothed path
+            # Find which obstacles appear in the smoothed path, and which layer(s)
+            # the current path's own run through each one actually used — needed
+            # below to tell "A* itself already went cross-layer here" (where its
+            # Z-transition math could be corrupted by phantom multi-hop hops, so
+            # the global search's answer is more trustworthy even if it looks
+            # longer) apart from "A* found a clean same-layer route" (where
+            # there's no reason to distrust it, and a cross-layer alternative
+            # should only replace it if actually shorter).
             obs_in_path = {}
             for pt in smoothed_path:
                 if pt.is_obstacle:
                     oidx = find_obstacle_index(pt.x, pt.y, pcbnew.FromMM(0.1))
-                    if oidx is not None and oidx not in obs_in_path:
-                        obs_in_path[oidx] = pt.layer
+                    if oidx is not None:
+                        obs_in_path.setdefault(oidx, set()).add(pt.layer)
 
-            for obs_idx, obs_layer in obs_in_path.items():
+            for obs_idx, obs_layers_seen in obs_in_path.items():
+                obs_layer = next(iter(obs_layers_seen))
+                _current_run_is_cross_layer = len(obs_layers_seen) > 1
                 glob_len_iu, glob_result = global_arc_minimum_for_obstacle(obs_idx, obs_layer)
                 if glob_result is None: continue
                 glob_arc, glob_hvp_layer, glob_hvm_layer, glob_ei, glob_ej = glob_result
@@ -1800,20 +1975,35 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                                        f"(layers: {board.GetLayerName(glob_hvp_layer)}->{board.GetLayerName(glob_hvm_layer)}, "
                                        f"Z-transit={z_mm:.3f}mm)")
                     replace = True
-                elif glob_hvp_layer != glob_hvm_layer:
-                    # Cross-layer: A* may use phantom multi-hop transitions
-                    # (e.g. In2.Cu→In1.Cu→F.Cu = 1.34mm instead of correct In2.Cu→F.Cu = 1.375mm),
-                    # producing a shorter-but-physically-wrong path. The global optimizer
-                    # uses only direct Z-gaps and is always authoritative for cross-layer.
+                elif glob_hvp_layer != glob_hvm_layer and _current_run_is_cross_layer:
+                    # Cross-layer AND the current path's own run through this
+                    # obstacle was already cross-layer too: A* may have used
+                    # phantom multi-hop transitions here (e.g. In2.Cu→In1.Cu→F.Cu
+                    # = 1.34mm instead of the correct direct In2.Cu→F.Cu =
+                    # 1.375mm), producing a shorter-but-physically-wrong number
+                    # for THIS specific run. The global search's direct Z-gap is
+                    # more trustworthy in that specific situation, even when it
+                    # looks longer — but this must NOT apply when the current
+                    # path is a clean same-layer route: there's no phantom-hop
+                    # risk to protect against there, and unconditionally
+                    # preferring a cross-layer alternative in that case would
+                    # silently discard a demonstrably shorter, already-correct
+                    # answer (confirmed as a real bug on a board where a legit
+                    # same-layer route via through-hole pads was being replaced
+                    # by a longer cross-layer 'shortcut' through an unrelated
+                    # obstacle).
                     z_mm = layer_gap_mm(glob_hvp_layer, glob_hvm_layer)
                     diag_lines.append(f"Global optimizer: cross-layer override ({curr_len:.4f}mm → {glob_len_mm:.4f}mm) "
                                        f"for obstacle#{obs_idx} "
                                        f"(layers: {board.GetLayerName(glob_hvp_layer)}->{board.GetLayerName(glob_hvm_layer)}, "
-                                       f"Z-transit={z_mm:.3f}mm; A* may have used phantom hops)")
+                                       f"Z-transit={z_mm:.3f}mm; current run was already cross-layer, A* may have used phantom hops)")
                     replace = True
                 else:
+                    _cross_note = (f" (a cross-layer alternative via {board.GetLayerName(glob_hvp_layer)}->"
+                                    f"{board.GetLayerName(glob_hvm_layer)} was considered and rejected for not "
+                                    f"being shorter)") if glob_hvp_layer != glob_hvm_layer else ""
                     diag_lines.append(f"Global optimizer: current path ({curr_len:.4f}mm) already optimal "
-                                       f"vs direct search ({glob_len_mm:.4f}mm) for obstacle#{obs_idx}")
+                                       f"vs direct search ({glob_len_mm:.4f}mm) for obstacle#{obs_idx}{_cross_note}")
                     replace = False
 
                 if replace:
@@ -2118,7 +2308,8 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             _kind_labels = {
                 'npth': 'NPTH hole wall',
                 'slot_or_edge': 'slot / board-edge cutout wall',
-                'third_net': 'third-net conductor surface (via-conductor shortcut)',
+                'third_net_via': 'third-net via/through-hole-pad wall',
+                'via_conductor_shortcut': 'third-net conductor surface (via-conductor shortcut)',
             }
             for i in range(len(smoothed_path) - 1):
                 pt1, pt2 = smoothed_path[i], smoothed_path[i+1]
@@ -2136,10 +2327,11 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                     # exposed boundary of some kind (there's no way to change layers
                     # along a surface path through unbroken solid stackup), so this is
                     # always resolvable to one of: an NPTH hole wall, a slot/board-edge
-                    # cutout wall, or (for the via-conductor shortcut specifically) a
-                    # third-net conductor's own copper surface.
+                    # cutout wall, a via/through-hole-pad wall, or (for the
+                    # via-conductor shortcut specifically) a third-net conductor's own
+                    # copper surface.
                     if used_via_conductor:
-                        kind = 'third_net'
+                        kind = 'via_conductor_shortcut'
                     else:
                         mx, my = (pt1.x + pt2.x) / 2.0, (pt1.y + pt2.y) / 2.0
                         oidx = find_obstacle_index(mx, my, pcbnew.FromMM(0.15))
