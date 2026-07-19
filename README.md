@@ -47,13 +47,17 @@ Select the plugin from the KiCad PCB Editor toolbar, choose your net pair, and e
 
 ## Notes
 Creepage distance requirements are based on Table F.5 of IEC 60664-1:2020.
+
 Known limitation (not a bug): sub-tolerance positional offset (not distance error) in KiCad's own round-cap tessellation at default poly_error_iu; confirmed to scale down roughly linearly with tighter tessellation tolerance via independent testing, tunable at the poly_error_iu constant.
+
 Drawing Layers
 Result text (net names, creepage/required/verdict) is placed on User.Comments.
 Path visualization (the drawn creepage path and contact-point markers) uses a layer chosen by which copper layer the path segment is actually on:
 
 F.Cu path segments → drawn on F.Adhesive
+
 B.Cu path segments → drawn on B.Adhesive
+
 Any inner copper layer (In1.Cu, In2.Cu, etc.) → drawn on Dwgs.User, since there's no dedicated adhesive layer per inner copper layer
 
 Cross-layer (Z-axis) transitions are not drawn as a visible segment — only the dielectric-gap distance is added to the total. There's no via graphic placed at these points.
