@@ -47,8 +47,39 @@ Select the plugin from the KiCad PCB Editor toolbar, choose your net pair, and e
 
 ## Notes
 Creepage distance requirements are based on Table F.5 of IEC 60664-1:2020.
+Known limitation (not a bug): sub-tolerance positional offset (not distance error) in KiCad's own round-cap tessellation at default poly_error_iu; confirmed to scale down roughly linearly with tighter tessellation tolerance via independent testing, tunable at the poly_error_iu constant.
 
 ## Changelog
+
+### v188.9–v188.11
+Progress dialog polish
+Replaced iteration-count-gated pulses (silently stopped updating entirely whenever a stage had fewer iterations than the gate threshold) with a wall-clock time throttle inside _progress() itself
+Added a pulse inside the per-edge loop of a single conductor's search, so one large conductor (e.g. a whole-board ground pour) shows live progress during its own processing, not just between conductors
+Widened the dialog via a longer initial placeholder message, and shortened per-stage message strings, fixing text wrapping that clipped the elapsed-time display
+
+### v188.8
+Performance: proximity-sorted pruning
+Sorted each conductor's edges by proximity to the HV+/HV- region before the main loop, so the pruning bound tightens almost immediately instead of only after scanning edges in arbitrary polygon order. Cut via-conductor search time roughly 11x on a real test board (135.67s → 12.16s) with identical results confirmed across three independent runs.
+
+### v188.7
+Timing instrumentation
+Added explicit timing brackets around the via-conductor search and final drawing/tagging stages, closing a gap where ~136s of runtime was previously unaccounted for in the log
+
+### v188.5–v188.6
+Performance: via-conductor search
+Unpruned search over every third-net conductor (dozens on a complex board) × every edge × every HV edge became the dominant cost once zone holes were correctly counted (more edges per zone). Added bounding-box pruning at the conductor level (v188.5) and the edge level (v188.6), skipping pairs that provably can't beat the current best distance before running expensive exact math or visibility checks.
+
+### v188.4
+Progress dialog (initial)
+Added wx.ProgressDialog with stage-based Pulse() updates, since KiCad plugins run synchronously and can look frozen on a large board
+
+### v188.3
+Bug fix: multi-piece board outlines
+Board-outline exclusion only checked individual Edge.Cuts shapes before stitching — worked for a single RECT outline, but a real outline built from many segments/arcs (rounded corners) meant no single piece ever matched the full board extent, so the assembled outline got treated as a giant solid obstacle. Added a post-stitch check against the assembled ring's own bounding box.
+
+### v188.2
+Bug fix: zone clearance holes ignored
+The third-net zone obstacle loop read only a zone's outer boundary, never its holes — treating an entire ground pour as solid copper, including where net A/B's own copper physically sits. Root cause of "NO PATH FOUND" on real boards with actual clearance holes. Added hole-aware obstacle membership check used everywhere obstacle geometry is tested.
 
 ### v188.1
 - Added detailed raw-edge diagnostic logging for the winning HV+/HV- edge pair in the global direct search

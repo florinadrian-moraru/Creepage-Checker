@@ -22,7 +22,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
     def Run(self):
         t0 = time.time()
         board = pcbnew.GetBoard()
-        BUILD_VERSION = "v188.1"
+        BUILD_VERSION = "v188.11"
 
         # =====================================================================
         # NET SELECTION + IEC 60664-1 PARAMETER DIALOG
@@ -59,6 +59,46 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 return
         else:
             required_creepage_mm = direct_distance_mm
+
+        # =====================================================================
+        # PROGRESS DIALOG — KiCad plugins run synchronously on the main thread,
+        # so true background progress isn't available; Pulse() at each stage
+        # boundary (plus periodically inside the pathfinding loop, the usual
+        # bottleneck on a large board) at least shows it's alive and roughly
+        # where it is, rather than looking frozen for however long a big board
+        # with hundreds of obstacles takes. Not a strict percentage — Pulse()
+        # just animates and updates the message text.
+        # =====================================================================
+        progress_dlg = None
+        try:
+            progress_dlg = wx.ProgressDialog(
+                f"{BUILD_VERSION} — Creepage Analysis",
+                "Starting creepage analysis, this may take a while on a complex board...",
+                maximum=100, parent=None,
+                style=wx.PD_APP_MODAL | wx.PD_ELAPSED_TIME | wx.PD_SMOOTH)
+        except Exception:
+            progress_dlg = None
+
+        _progress_last_call = [0.0]  # mutable single-element container for closure access
+
+        def _progress(msg, force=False):
+            # Time-throttled, not iteration-count-throttled: a fixed "every N
+            # iterations" gate silently stops updating entirely whenever a
+            # stage has fewer than N iterations total (exactly what caused the
+            # elapsed-time display to freeze during a short via-conductor
+            # search) — throttling by wall-clock time instead means the UI
+            # stays live regardless of how work happens to be distributed.
+            # Cheap enough to call on every iteration of any loop.
+            if progress_dlg is None:
+                return
+            now = time.time()
+            if not force and (now - _progress_last_call[0]) < 0.25:
+                return
+            _progress_last_call[0] = now
+            try:
+                progress_dlg.Pulse(msg)
+            except Exception:
+                pass
 
         try:
             settings = board.GetDesignSettings()
@@ -251,7 +291,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         for d in list(board.GetDrawings()):
             _d_width = d.GetWidth() if hasattr(d, 'GetWidth') else None
             _d_text = d.GetText() if hasattr(d, 'GetText') else ""
-            if d.GetLayer() in [comment_layer, pcbnew.F_SilkS, pcbnew.B_SilkS, pcbnew.Dwgs_User, pcbnew.F_Adhes, pcbnew.B_Adhes] and (_d_width == magic_width or _d_width == magic_marker_width or ("CREEPAGE" in _d_text.upper()) or ("REQUIRED" in _d_text.upper()) or ("NO PATH FOUND" in _d_text.upper()) or ("NO COPPER NODES" in _d_text.upper())):
+            if d.GetLayer() in [comment_layer, pcbnew.F_SilkS, pcbnew.B_SilkS, pcbnew.Dwgs_User, pcbnew.F_Adhes, pcbnew.B_Adhes] and (_d_width == magic_width or _d_width == magic_marker_width or ("CREEPAGE" in _d_text.upper()) or ("IEC REQUIRED" in _d_text.upper()) or ("NO PATH FOUND" in _d_text.upper()) or ("NO COPPER NODES" in _d_text.upper())):
                 board.Remove(d)
         for t in list(board.GetTracks()):
             if isinstance(t, pcbnew.PCB_VIA) and t.GetWidth() == magic_via_width:
@@ -265,7 +305,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         # instead comes from lazy/memoized evaluation below (only compute what the
         # search actually visits) rather than from reducing resolution.
         res_iu = pcbnew.FromMM(0.025)
-        poly_error_iu = int(pcbnew.FromMM(0.001))
+        poly_error_iu = int(pcbnew.FromMM(0.01))
 
         enabled_copper_layers = []
         for i in range(128):
@@ -428,6 +468,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
         t1 = time.time()
         diag_lines.append(f"Timing - Stackup extraction: {t1-t0:.2f}s")
+        _progress("Extracting net A/B copper geometry...", force=True)
 
         # =====================================================================
         # GEOMETRY EXTRACTION - NET A / NET B COPPER (the two nets being measured)
@@ -524,6 +565,8 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
         if not all_rows:
             self.draw_text(board, comment_layer, f"NO COPPER NODES FOUND FOR '{NET_A_NAME}' TO '{NET_B_NAME}'", None)
             flush_diagnostics()
+            if progress_dlg is not None:
+                progress_dlg.Destroy()
             return
 
         min_r, max_r = min(all_rows), max(all_rows)
@@ -535,6 +578,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
         t2 = time.time()
         diag_lines.append(f"Timing - Copper extraction: {t2-t1:.2f}s")
+        _progress("Extracting obstacles (pads, vias, zones, slots)...", force=True)
 
         # =====================================================================
         # OBSTACLE EXTRACTION - STITCHING & SOLIDIFYING
@@ -549,6 +593,10 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                              # each Z-transition in the path with what kind of exposed discontinuity it passes
                              # through, so pollution-degree judgment calls (coating exposure, slot walls, etc.)
                              # can be made with the facts in hand rather than the tool guessing at compliance.
+        obstacle_holes = []  # parallel to obstacle_polygons: list of hole-ring-point-lists cut out of that
+                              # obstacle's solid area (e.g. zone clearance around other-net copper). A point
+                              # inside the outline but also inside one of these holes is NOT solid — see
+                              # point_in_obstacle(). Empty list for obstacles with no holes (the normal case).
         exact_hole_edges = []
 
         npth_pads = [p for p in board.GetPads() if p.GetAttribute() == pcbnew.PAD_ATTRIB_NPTH]
@@ -568,6 +616,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                     if len(ring) >= 3:
                         obstacle_polygons.append(ring)
                         obstacle_kind.append('npth')
+                        obstacle_holes.append([])
 
         # Plated pads/vias belonging to neither net A nor net B (a third net, or
         # no net at all) have real copper sitting between the two nets being
@@ -613,6 +662,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         if len(ring) >= 3:
                             obstacle_polygons.append(ring)
                             obstacle_kind.append('third_net')
+                            obstacle_holes.append([])
                             conductor_polys_by_layer.setdefault(pad_layer, []).append(ring)
                             _pad_added = True
                 except Exception as e:
@@ -645,11 +695,16 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         exact_hole_edges.append((x1, y1, x2, y2))
                     obstacle_polygons.append(ring)
                     obstacle_kind.append('third_net')
+                    obstacle_holes.append([])
         # Zones belonging to neither net A nor net B (e.g. a GND pour, possibly
         # on an inner layer) are real filled copper, so the surface path must
-        # route around them too. Only the zone's own filled outline is used
-        # (not its internal clearance holes, which aren't copper and so
-        # aren't separate obstacles).
+        # route around them too. A zone's fill routinely has holes cut out of
+        # it — clearance around every other-net pad/trace it clears, including
+        # net A/B's own copper — and those holes are NOT copper, so they must
+        # be subtracted from the outline's solid area, not ignored. Ignoring
+        # them would treat the zone's entire outer boundary as solid, which
+        # can easily engulf net A/B's own copper on a real board with a large
+        # ground pour, making a real path look nonexistent.
         _other_zone_count = 0
         for zone in board.Zones():
             net_name = zone.GetNetname()
@@ -679,8 +734,20 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         exact_hole_edges.append((p1z.x, p1z.y, p2z.x, p2z.y))
                         ring.append((p1z.x, p1z.y))
                     if len(ring) >= 3:
+                        holes_for_ring = []
+                        for h_idx in range(poly_set.HoleCount(p_idx)):
+                            hole_outline = poly_set.Hole(p_idx, h_idx)
+                            n_hpts = hole_outline.PointCount()
+                            hole_ring = []
+                            for hk in range(n_hpts):
+                                hp1, hp2 = hole_outline.CPoint(hk), hole_outline.CPoint((hk + 1) % n_hpts)
+                                exact_hole_edges.append((hp1.x, hp1.y, hp2.x, hp2.y))
+                                hole_ring.append((hp1.x, hp1.y))
+                            if len(hole_ring) >= 3:
+                                holes_for_ring.append(hole_ring)
                         obstacle_polygons.append(ring)
                         obstacle_kind.append('third_net')
+                        obstacle_holes.append(holes_for_ring)
                         conductor_polys_by_layer.setdefault(layer, []).append(ring)
                         _other_zone_count += 1
                         _zone_added = True
@@ -801,6 +868,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                             if len(ring) >= 3:
                                 obstacle_polygons.append(ring)
                                 obstacle_kind.append('slot_or_edge')
+                                obstacle_holes.append([])
                 except Exception:
                     pass
 
@@ -832,8 +900,26 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         changed = True
                     else: i += 1
             if math.hypot(current_ring[0].x - current_ring[-1].x, current_ring[0].y - current_ring[-1].y) < stitch_tol:
-                obstacle_polygons.append([(pt.x, pt.y) for pt in current_ring])
-                obstacle_kind.append('slot_or_edge')
+                _ring_xs = [pt.x for pt in current_ring]
+                _ring_ys = [pt.y for pt in current_ring]
+                _ring_is_outline = False
+                if _ec_min_x is not None:
+                    _tol = pcbnew.FromMM(0.5)
+                    _ring_is_outline = (abs(min(_ring_xs) - _ec_min_x) < _tol and
+                                         abs(min(_ring_ys) - _ec_min_y) < _tol and
+                                         abs(max(_ring_xs) - _ec_max_x) < _tol and
+                                         abs(max(_ring_ys) - _ec_max_y) < _tol)
+                if _ring_is_outline:
+                    _outline_shapes_skipped += 1
+                    diag_lines.append(f"Skipped a stitched ring ({len(current_ring)} points) whose bounding box "
+                                       f"matches the full board extent — this is the board outline assembled from "
+                                       f"multiple segments/arcs (no single piece individually matched the full "
+                                       f"extent, so the per-shape check alone couldn't catch it before stitching). "
+                                       f"Not treated as an obstacle.")
+                else:
+                    obstacle_polygons.append([(pt.x, pt.y) for pt in current_ring])
+                    obstacle_kind.append('slot_or_edge')
+                    obstacle_holes.append([])
 
         if _outline_shapes_skipped:
             diag_lines.append(f"Skipped {_outline_shapes_skipped} Edge.Cuts shape(s) identified as the board outline "
@@ -900,6 +986,22 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 p1x, p1y = p2x, p2y
             return inside
 
+        def point_in_obstacle(x, y, idx):
+            # A point counts as inside obstacle_polygons[idx] only if it's inside
+            # that outline AND not inside any of ITS holes. Without this, a zone's
+            # clearance cutouts (around every other-net pad/trace it clears —
+            # including net A/B's own copper) would be silently ignored, and the
+            # zone's entire outer boundary would be treated as solid copper even
+            # where it demonstrably isn't. This is what a real ground pour with
+            # real clearance holes needs; the earlier simple test boards never
+            # had a zone with holes, so this gap never surfaced until now.
+            if not point_in_polygon(x, y, obstacle_polygons[idx]):
+                return False
+            for hole in obstacle_holes[idx]:
+                if point_in_polygon(x, y, hole):
+                    return False
+            return True
+
         # Pad/edge bounding boxes computed once up front, reused across every grid
         # cell query instead of recomputing them on every call.
         npth_pad_bboxes = [(p, p.GetBoundingBox()) for p in npth_pads]
@@ -907,6 +1009,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
         t3 = time.time()
         diag_lines.append(f"Timing - Obstacle extraction + stitching: {t3-t2:.2f}s")
+        _progress("Pathfinding (often the slowest stage)...", force=True)
 
         # =====================================================================
         # LAZY / MEMOIZED GRID: a cell's blocked/free status (and is_portal) is
@@ -937,7 +1040,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 for idx, poly in enumerate(obstacle_polygons):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx]
                     if bx1 <= real_x <= bx2 and by1 <= real_y <= by2:
-                        if point_in_polygon(real_x, real_y, poly): inside = True; break
+                        if point_in_obstacle(real_x, real_y, idx): inside = True; break
 
             if not inside:
                 for dwg, bbox in edge_cuts_bboxes:
@@ -983,7 +1086,11 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 heapq.heappush(pq, (0.0, layer, r, c))
 
         res_mm = pcbnew.ToMM(res_iu)
+        _pf_iter = 0
         while pq:
+            _pf_iter += 1
+            if _pf_iter % 200 == 0:
+                _progress(f"Pathfinding: {len(grid_mask_cache)} cells evaluated")
             d, layer, r, c = heapq.heappop(pq)
             if d > dist_matrix.get((layer, r, c), float('inf')): continue
             if d >= global_min_dist: break
@@ -1016,6 +1123,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
         t4 = time.time()
         diag_lines.append(f"Timing - Pathfinding: {t4-t3:.2f}s (cells evaluated: {len(grid_mask_cache)})")
+        _progress("Smoothing path, correcting boundaries...", force=True)
 
         if term_node:
             raw_path = []
@@ -1121,7 +1229,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 for idx2, poly2 in enumerate(obstacle_polygons):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx2]
                     if not (bx1 <= mx <= bx2 and by1 <= my <= by2): continue
-                    if point_in_polygon(mx, my, poly2):
+                    if point_in_obstacle(mx, my, idx2):
                         return False
                 return True
 
@@ -1217,7 +1325,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 for idx, poly in enumerate(obstacle_polygons):
                     bx1, by1, bx2, by2 = obstacle_bboxes[idx]
                     if not (bx1 <= mx <= bx2 and by1 <= my <= by2): continue
-                    if point_in_polygon(mx, my, poly):
+                    if point_in_obstacle(mx, my, idx):
                         return False
                 return True
 
@@ -1648,6 +1756,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
             t5 = time.time()
             diag_lines.append(f"Timing - Smoothing + tangent correction + global opt: {t5-t4:.2f}s")
+            _progress("Running exact global direct-distance search...", force=True)
 
             def _seg_seg_closest(p1, p2, p3, p4):
                 # Exact closest points between two finite line segments (p1-p2)
@@ -1734,6 +1843,37 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
 
             t5b = time.time()
             diag_lines.append(f"Timing - Global direct search: {t5b-t5:.2f}s")
+            _progress("Finalizing result and drawing output...", force=True)
+
+            # The current best distance found so far (main A*+tangent+global-arc
+            # path), computed HERE (before via-conductor search) so it can be used
+            # as a pruning bound below — a conductor whose bounding box can't
+            # possibly beat this distance doesn't need its edges examined at all.
+            curr_direct_mm = 0.0
+            for k in range(len(smoothed_path)-1):
+                p1t, p2t = smoothed_path[k], smoothed_path[k+1]
+                if p1t.layer == p2t.layer:
+                    curr_direct_mm += math.hypot(pcbnew.ToMM(p2t.x-p1t.x), pcbnew.ToMM(p2t.y-p1t.y))
+                else:
+                    curr_direct_mm += layer_gap_mm(p1t.layer, p2t.layer)
+
+            def _bbox_of_points(pts):
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                return (min(xs), min(ys), max(xs), max(ys))
+
+            def _bbox_of_edges(edges):
+                xs, ys = [], []
+                for (x1, y1, x2, y2) in edges:
+                    xs.append(x1); xs.append(x2); ys.append(y1); ys.append(y2)
+                return (min(xs), min(ys), max(xs), max(ys)) if xs else None
+
+            def _bbox_gap(bb1, bb2):
+                # Lower-bound distance between two axis-aligned boxes (0 if they
+                # overlap/touch). Always <= the true minimum distance between any
+                # geometry inside them, so it's safe to use as a pruning bound.
+                dx = max(bb1[0] - bb2[2], bb2[0] - bb1[2], 0)
+                dy = max(bb1[1] - bb2[3], bb2[1] - bb1[3], 0)
+                return math.hypot(dx, dy)
 
             # VIA-CONDUCTOR SHORTCUT SEARCH
             # IEC creepage rule: when a conductive part (third net, e.g. GND) sits between
@@ -1745,13 +1885,43 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             via_cond_path_pts = None  # (vc_layer, hvm_boundary, cond_entry, cond_exit, hvp_boundary)
 
             if conductor_polys_by_layer:
+                _pruned_conductors = 0
+                _examined_conductors = 0
                 for vc_layer in enabled_copper_layers:
                     if vc_layer not in conductor_polys_by_layer: continue
                     hvp_l_vc = hvp_edges_by_layer.get(vc_layer, [])
                     hvm_l_vc = hvm_edges_by_layer.get(vc_layer, [])
                     if not hvp_l_vc or not hvm_l_vc: continue
 
+                    hvp_bbox_vc = _bbox_of_edges(hvp_l_vc)
+                    hvm_bbox_vc = _bbox_of_edges(hvm_l_vc)
+                    # Per-edge bboxes precomputed ONCE per layer, reused across every
+                    # conductor on that layer — this is what lets the inner loop reject
+                    # a pair with a single cheap comparison instead of running the full
+                    # exact segment math (and, worse, the O(exact_hole_edges) visibility
+                    # check) on every single pair. Critical for a large ground pour with
+                    # thousands of edges from correctly-processed clearance holes.
+                    def _edge_bbox(e):
+                        x1, y1, x2, y2 = e
+                        return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                    hvm_edges_bb_vc = [_edge_bbox(e) for e in hvm_l_vc]
+                    hvp_edges_bb_vc = [_edge_bbox(e) for e in hvp_l_vc]
+
                     for vc_poly in conductor_polys_by_layer[vc_layer]:
+                        # Best possible via-conductor total is bounded below by the
+                        # bbox-to-bbox gaps on each side — if that lower bound
+                        # can't beat the best distance found so far (main path OR
+                        # any via-conductor candidate already found), this
+                        # conductor's actual edges never need to be examined.
+                        best_so_far_mm = curr_direct_mm if via_cond_best_mm is None else min(curr_direct_mm, via_cond_best_mm)
+                        best_so_far_iu = pcbnew.FromMM(best_so_far_mm)
+                        vc_bbox = _bbox_of_points(vc_poly)
+                        lower_bound = _bbox_gap(vc_bbox, hvm_bbox_vc) + _bbox_gap(vc_bbox, hvp_bbox_vc)
+                        if lower_bound >= best_so_far_iu:
+                            _pruned_conductors += 1
+                            continue
+                        _examined_conductors += 1
+                        _progress(f"Via search: {_examined_conductors} examined, {_pruned_conductors} pruned")
                         # INDEPENDENT optimisation: find best HV- contact and best HV+ contact
                         # separately — the conductor lets them be at different points (0mm transit).
                         # Searched EDGE-to-EDGE (both the GND boundary and the HV boundary are
@@ -1762,14 +1932,36 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                         best_d_hvp_vc, best_hvp_pt_vc, best_hvp_cpt = float('inf'), None, None
 
                         n_vc = len(vc_poly)
-                        vc_edges = [(vc_poly[i], vc_poly[(i+1) % n_vc]) for i in range(n_vc)]
+                        vc_edges_raw = [(vc_poly[i], vc_poly[(i+1) % n_vc]) for i in range(n_vc)]
 
-                        for (g1, g2) in vc_edges:
-                            for (hx1, hy1, hx2, hy2) in hvm_l_vc:
+                        def _vc_edge_bbox(e):
+                            ea, eb = e
+                            return (min(ea[0], eb[0]), min(ea[1], eb[1]), max(ea[0], eb[0]), max(ea[1], eb[1]))
+
+                        # Sort by proximity to the combined HV+/HV- region so the
+                        # tightest best-so-far bound gets established almost
+                        # immediately, letting the per-pair pruning below reject
+                        # the (likely large) majority of a big conductor's edges
+                        # outright instead of scanning them with a still-loose
+                        # bound. Without this, edges are examined in raw polygon
+                        # order, and if the genuinely close ones happen to appear
+                        # late, most of a multi-thousand-edge zone gets fully
+                        # scanned before pruning helps at all — this is what made
+                        # a whole-board ground pour with correctly-processed
+                        # clearance holes take minutes instead of seconds.
+                        vc_edges = [(e, _vc_edge_bbox(e)) for e in vc_edges_raw]
+                        vc_edges.sort(key=lambda eb: min(_bbox_gap(eb[1], hvm_bbox_vc), _bbox_gap(eb[1], hvp_bbox_vc)))
+
+                        for _ei, ((g1, g2), g_bbox) in enumerate(vc_edges):
+                            if _ei % 50 == 0:
+                                _progress(f"Via search: conductor {_examined_conductors}, edge {_ei}/{len(vc_edges)}")
+                            for hi, (hx1, hy1, hx2, hy2) in enumerate(hvm_l_vc):
+                                if _bbox_gap(g_bbox, hvm_edges_bb_vc[hi]) >= best_d_hvm_vc: continue
                                 dist, gpt, hpt = _seg_seg_closest(g1, g2, (hx1, hy1), (hx2, hy2))
                                 if dist < best_d_hvm_vc and _tuple_los(hpt, gpt):
                                     best_d_hvm_vc, best_hvm_pt_vc, best_hvm_cpt = dist, hpt, gpt
-                            for (hx1, hy1, hx2, hy2) in hvp_l_vc:
+                            for hi, (hx1, hy1, hx2, hy2) in enumerate(hvp_l_vc):
+                                if _bbox_gap(g_bbox, hvp_edges_bb_vc[hi]) >= best_d_hvp_vc: continue
                                 dist, gpt, hpt = _seg_seg_closest(g1, g2, (hx1, hy1), (hx2, hy2))
                                 if dist < best_d_hvp_vc and _tuple_los(gpt, hpt):
                                     best_d_hvp_vc, best_hvp_pt_vc, best_hvp_cpt = dist, hpt, gpt
@@ -1785,19 +1977,22 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                                                    f"(d_HVM={pcbnew.ToMM(int(round(best_d_hvm_vc))):.4f}mm, "
                                                    f"d_HVP={pcbnew.ToMM(int(round(best_d_hvp_vc))):.4f}mm)")
 
+                diag_lines.append(f"Via-conductor search: {_examined_conductors} conductor(s) examined, "
+                                   f"{_pruned_conductors} pruned by bounding box before touching their edges "
+                                   f"(out of {_examined_conductors + _pruned_conductors} total candidates)")
+
+            t5c = time.time()
+            diag_lines.append(f"Timing - Via-conductor search: {t5c-t5b:.2f}s")
+            _progress("Drawing final path and markers...", force=True)
+
             # Pick the shortest of: the main A*+tangent+global-arc-optimizer path,
             # the via-conductor shortcut, and the new exact direct search — each
             # targets a different scenario (detour required, third-net conductor
             # shortcut, clear line of sight) and only one will actually apply for
             # any given board, but whichever is genuinely shortest wins.
-            curr_direct_mm = 0.0
-            for k in range(len(smoothed_path)-1):
-                p1t, p2t = smoothed_path[k], smoothed_path[k+1]
-                if p1t.layer == p2t.layer:
-                    curr_direct_mm += math.hypot(pcbnew.ToMM(p2t.x-p1t.x), pcbnew.ToMM(p2t.y-p1t.y))
-                else:
-                    curr_direct_mm += layer_gap_mm(p1t.layer, p2t.layer)
-
+            # (curr_direct_mm was already computed above, before the via-conductor
+            # search, where it's needed as a pruning bound — smoothed_path hasn't
+            # changed since, so recomputing it here would just be redundant work.)
             used_via_conductor = False
             if via_cond_best_mm is not None and via_cond_best_mm < curr_direct_mm - 0.001:
                 diag_lines.append(f"Via-conductor wins: {via_cond_best_mm:.4f}mm < direct {curr_direct_mm:.4f}mm — using conductor shortcut path")
@@ -1967,7 +2162,7 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
             if required_creepage_mm is not None:
                 margin_mm = final_distance_mm - required_creepage_mm
                 verdict_word = "PASS" if margin_mm >= 0 else "FAIL"
-                lines.append(f"REQUIRED: {required_creepage_mm:.3f} mm")
+                lines.append(f"IEC REQUIRED: {required_creepage_mm:.3f} mm")
                 lines.append(f"{verdict_word} (margin {margin_mm:+.3f} mm)")
             self.draw_text(board, comment_layer, "\n".join(lines), pos)
             diag_lines.append(f"Final measured distance: {final_distance_mm:.3f} mm")
@@ -1975,12 +2170,16 @@ class TrueGeometricCreepageEngine(pcbnew.ActionPlugin):
                 diag_lines.append(f"Required creepage (IEC 60664-1): {required_creepage_mm:.3f} mm | "
                                    f"Margin: {final_distance_mm - required_creepage_mm:+.3f} mm | "
                                    f"Verdict: {'PASS' if final_distance_mm >= required_creepage_mm else 'FAIL'}")
+            diag_lines.append(f"Timing - Drawing/tagging/markers: {time.time()-t5c:.2f}s")
             diag_lines.append(f"Total time: {time.time()-t0:.2f}s")
             flush_diagnostics()
         else:
             diag_lines.append("NO PATH FOUND")
             self.draw_text(board, comment_layer, f"NO PATH FOUND between '{NET_A_NAME}' and '{NET_B_NAME}'", None)
             flush_diagnostics()
+
+        if progress_dlg is not None:
+            progress_dlg.Destroy()
 
     def show_config_dialog(self, net_names):
         """
